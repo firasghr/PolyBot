@@ -1,0 +1,46 @@
+# ---- PolyBot .gitignore ----
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.log
+
+# Environment secrets — never commit the real .env
+.env
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+
+# Docker
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

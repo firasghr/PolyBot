@@ -1,0 +1,43 @@
+services:
+  # ---- Python backend (FastAPI) ----
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: polybot-backend:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - polybot
+
+  # ---- React frontend (served by nginx) ----
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    image: polybot-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - polybot
+
+networks:
+  polybot:
+    driver: bridge
+
+volumes:
+  logs:
