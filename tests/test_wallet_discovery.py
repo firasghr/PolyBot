@@ -10,6 +10,7 @@ from src.wallet_discovery import (
     _build_wallet_stats,
     _classify_market,
     _compute_sharpe,
+    _compute_wallet_score,
 )
 
 
@@ -64,14 +65,37 @@ class TestComputeSharpe:
 
 
 # ---------------------------------------------------------------------------
+# Composite scoring
+# ---------------------------------------------------------------------------
+class TestComputeWalletScore:
+    def test_perfect_score(self):
+        stats = {"win_rate": 1.0, "sharpe_ratio": 3.0, "total_pnl_usdc": 10000, "trade_count": 500}
+        score = _compute_wallet_score(stats)
+        assert score == pytest.approx(1.0, abs=0.01)
+
+    def test_zero_score(self):
+        stats = {"win_rate": 0.0, "sharpe_ratio": 0.0, "total_pnl_usdc": 0, "trade_count": 0}
+        score = _compute_wallet_score(stats)
+        assert score == 0.0
+
+    def test_mid_range(self):
+        stats = {"win_rate": 0.65, "sharpe_ratio": 1.5, "total_pnl_usdc": 5000, "trade_count": 250}
+        score = _compute_wallet_score(stats)
+        assert 0.3 < score < 0.7
+
+
+# ---------------------------------------------------------------------------
 # Wallet stats builder
 # ---------------------------------------------------------------------------
 class TestBuildWalletStats:
     def _make_positions(self, n=150, win_pct=0.65):
-        """Generate synthetic position records."""
+        """Generate synthetic position records with real win/loss PnL."""
         positions = []
         for i in range(n):
-            pnl = 50.0 if (i / n) < win_pct else -30.0
+            if (i / n) < win_pct:
+                pnl = 50.0   # winning trade
+            else:
+                pnl = -30.0  # losing trade
             positions.append({
                 "pnl": pnl,
                 "size": 1000.0,
@@ -99,8 +123,11 @@ class TestBuildWalletStats:
         positions = self._make_positions(n=150, win_pct=0.70)
         result = _build_wallet_stats("0xABC", positions)
         required = {
-            "wallet", "trade_count", "win_rate", "avg_position_size_usdc",
-            "market_focus", "market_distribution", "sharpe_ratio", "total_pnl_usdc",
+            "wallet", "name", "pseudonym", "profile_image", "bio",
+            "trade_count", "decided_trades", "win_rate",
+            "avg_position_size_usdc", "avg_win_usdc", "avg_loss_usdc",
+            "market_focus", "market_distribution", "sharpe_ratio",
+            "total_pnl_usdc", "composite_score",
         }
         assert required.issubset(result.keys())
 
@@ -119,13 +146,26 @@ class TestBuildWalletStats:
         result = _build_wallet_stats("0xABC", positions)
         assert abs(result["win_rate"] - 0.75) < 0.02
 
-    def test_market_focus_crypto(self):
+    def test_avg_win_loss_computed(self):
         positions = self._make_positions(n=150, win_pct=0.70)
-        # all positions reference BTC or election; crypto appears ~half the time
         result = _build_wallet_stats("0xABC", positions)
-        assert result["market_focus"] in ("crypto", "politics", "other")
+        assert result["avg_win_usdc"] > 0
+        assert result["avg_loss_usdc"] > 0
+
+    def test_composite_score_present(self):
+        positions = self._make_positions(n=150, win_pct=0.70)
+        result = _build_wallet_stats("0xABC", positions)
+        assert 0.0 <= result["composite_score"] <= 1.0
 
     def test_sharpe_finite(self):
         positions = self._make_positions(n=150, win_pct=0.70)
         result = _build_wallet_stats("0xABC", positions)
         assert math.isfinite(result["sharpe_ratio"])
+
+    def test_mixed_pnl_gives_realistic_win_rate(self):
+        """Ensure that mixed positive/negative PnL produces realistic win rates."""
+        positions = self._make_positions(n=200, win_pct=0.60)
+        result = _build_wallet_stats("0xABC", positions)
+        assert result is not None
+        assert result["win_rate"] < 1.0  # Must NOT be 100%
+        assert result["win_rate"] > 0.5

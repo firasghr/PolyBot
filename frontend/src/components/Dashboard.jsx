@@ -25,7 +25,7 @@ const fmtUsd = (n) =>
     ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n)
     : '—'
 
-export default function Dashboard({ traders = [], pnl = {}, sizing = [] }) {
+export default function Dashboard({ traders = [], pnl = {}, sizing = [], portfolio = {} }) {
   /* ---- PnL metrics ---- */
   const pnlColor  = (pnl.realised_pnl_usdc ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'
   const ddColor   = (pnl.max_drawdown_pct  ?? 0) <= 5  ? 'text-green-400' : 'text-yellow-400'
@@ -40,7 +40,13 @@ export default function Dashboard({ traders = [], pnl = {}, sizing = [] }) {
   return (
     <div className="space-y-6">
       {/* ---- Metric cards ---- */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <MetricCard
+          label="Portfolio Value"
+          value={fmtUsd(portfolio.total_value_usdc)}
+          sub={`Cash: ${fmtUsd(portfolio.cash_usdc)}`}
+          color="text-white"
+        />
         <MetricCard
           label="Realised PnL"
           value={fmtUsd(pnl.realised_pnl_usdc)}
@@ -114,33 +120,81 @@ export default function Dashboard({ traders = [], pnl = {}, sizing = [] }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-xs text-gray-400 border-b border-gray-700">
-                  <th className="pb-2 pr-4">Wallet</th>
+                  <th className="pb-2 pr-4">Trader</th>
+                  <th className="pb-2 pr-4">Score</th>
                   <th className="pb-2 pr-4">Win Rate</th>
                   <th className="pb-2 pr-4">Trades</th>
                   <th className="pb-2 pr-4">Avg Size</th>
                   <th className="pb-2 pr-4">Sharpe</th>
+                  <th className="pb-2 pr-4">PnL</th>
                   <th className="pb-2">Focus</th>
                 </tr>
               </thead>
               <tbody>
-                {traders.map((t) => (
-                  <tr key={t.wallet} className="border-b border-gray-700/50 hover:bg-gray-700/30 transition-colors">
-                    <td className="py-2 pr-4 font-mono text-xs text-gray-300">
-                      {t.wallet.slice(0, 6)}…{t.wallet.slice(-4)}
-                    </td>
-                    <td className={`py-2 pr-4 font-semibold ${t.win_rate >= 0.7 ? 'text-green-400' : 'text-yellow-400'}`}>
-                      {fmt(t.win_rate * 100)}%
-                    </td>
-                    <td className="py-2 pr-4 text-gray-300">{t.trade_count}</td>
-                    <td className="py-2 pr-4 text-gray-300">{fmtUsd(t.avg_position_size_usdc)}</td>
-                    <td className="py-2 pr-4 text-blue-300">{fmt(t.sharpe_ratio)}</td>
-                    <td className="py-2">
-                      <span className="px-2 py-0.5 rounded-full text-xs bg-gray-700 text-gray-300 capitalize">
-                        {t.market_focus}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                {traders.map((t) => {
+                  const displayName = t.name || t.pseudonym || `${t.wallet.slice(0, 6)}…${t.wallet.slice(-4)}`
+                  const hasImage = t.profile_image && t.profile_image.length > 0
+                  return (
+                    <tr key={t.wallet} className="border-b border-gray-700/50 hover:bg-gray-700/30 transition-colors">
+                      <td className="py-2 pr-4">
+                        <a
+                          href={`https://polymarket.com/profile/${t.wallet}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-3 hover:opacity-80 transition-opacity"
+                        >
+                          {hasImage ? (
+                            <img
+                              src={t.profile_image}
+                              alt={displayName}
+                              className="w-8 h-8 rounded-full object-cover flex-shrink-0"
+                              onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
+                            />
+                          ) : null}
+                          <div
+                            className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold text-white"
+                            style={{
+                              display: hasImage ? 'none' : 'flex',
+                              background: `linear-gradient(135deg, hsl(${parseInt(t.wallet.slice(2, 6), 16) % 360}, 70%, 50%), hsl(${(parseInt(t.wallet.slice(2, 6), 16) + 60) % 360}, 70%, 40%))`,
+                            }}
+                          >
+                            {(t.name || t.pseudonym || t.wallet.slice(2, 4)).slice(0, 2).toUpperCase()}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-gray-200 font-medium truncate text-sm hover:text-blue-400 transition-colors">{displayName}</div>
+                            <div className="text-gray-500 font-mono text-[10px]">
+                              {t.wallet.slice(0, 6)}…{t.wallet.slice(-4)}
+                              {t.bio && <span className="ml-1 text-gray-600">· {t.bio.slice(0, 30)}</span>}
+                            </div>
+                          </div>
+                          <svg className="w-3.5 h-3.5 text-gray-600 flex-shrink-0 ml-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                          </svg>
+                        </a>
+                      </td>
+                      <td className="py-2 pr-4">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-purple-400 font-bold">{fmt(t.composite_score * 100, 0)}</span>
+                          <span className="text-xs text-purple-400/50">/100</span>
+                        </div>
+                      </td>
+                      <td className={`py-2 pr-4 font-semibold ${t.win_rate >= 0.55 ? 'text-green-400' : 'text-yellow-400'}`}>
+                        {fmt(t.win_rate * 100)}%
+                      </td>
+                      <td className="py-2 pr-4 text-gray-300">{t.trade_count}</td>
+                      <td className="py-2 pr-4 text-gray-300">{fmtUsd(t.avg_position_size_usdc)}</td>
+                      <td className="py-2 pr-4 text-blue-300">{fmt(t.sharpe_ratio)}</td>
+                      <td className={`py-2 pr-4 font-semibold ${(t.total_pnl_usdc ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {fmtUsd(t.total_pnl_usdc)}
+                      </td>
+                      <td className="py-2">
+                        <span className="px-2 py-0.5 rounded-full text-xs bg-gray-700 text-gray-300 capitalize">
+                          {t.market_focus}
+                        </span>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

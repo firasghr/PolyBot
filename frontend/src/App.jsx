@@ -20,6 +20,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('Dashboard')
   const [traders, setTraders]     = useState([])
   const [pnl, setPnl]             = useState({})
+  const [portfolio, setPortfolio] = useState({})
   const [positions, setPositions] = useState([])
   const [sizing, setSizing]       = useState([])
   const [alerts, setAlerts]       = useState([])
@@ -31,16 +32,18 @@ export default function App() {
   /* ------------------------------------------------------------------ */
   const fetchAll = useCallback(async () => {
     try {
-      const [tradersRes, pnlRes, posRes, sizingRes] = await Promise.all([
+      const [tradersRes, pnlRes, posRes, sizingRes, portRes] = await Promise.all([
         fetch(`${API_BASE}/api/traders`),
         fetch(`${API_BASE}/api/pnl`),
         fetch(`${API_BASE}/api/positions`),
         fetch(`${API_BASE}/api/sizing`),
+        fetch(`${API_BASE}/api/portfolio`),
       ])
       if (tradersRes.ok) setTraders((await tradersRes.json()).traders ?? [])
       if (pnlRes.ok)     setPnl(await pnlRes.json())
       if (posRes.ok)     setPositions((await posRes.json()).open_positions ?? [])
       if (sizingRes.ok)  setSizing((await sizingRes.json()).sizing ?? [])
+      if (portRes.ok)    setPortfolio(await portRes.json())
     } catch (err) {
       console.error('Fetch error:', err)
     }
@@ -148,7 +151,7 @@ export default function App() {
       {/* ---- Content ---- */}
       <main className="flex-1 p-6">
         {activeTab === 'Dashboard' && (
-          <Dashboard traders={traders} pnl={pnl} sizing={sizing} />
+          <Dashboard traders={traders} pnl={pnl} sizing={sizing} portfolio={portfolio} />
         )}
         {activeTab === 'Positions' && (
           <Positions positions={positions} onRefresh={fetchAll} apiBase={API_BASE} />

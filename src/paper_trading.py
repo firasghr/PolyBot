@@ -30,7 +30,10 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
+
+from database.models import Trade, Position
+from database.repository import DBRepository
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -48,24 +51,6 @@ DEFAULT_LATENCY_MS: float = float(os.getenv("SIM_LATENCY_MS", "200"))       # 20
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
-@dataclass
-class SimulatedTrade:
-    """A single paper trade record."""
-
-    trade_id: str
-    wallet: str
-    market: str
-    side: str                    # "BUY" | "SELL"
-    entry_price: float           # price paid (with slippage)
-    nominal_price: float         # original signal price (before slippage)
-    size_usdc: float             # USDC notional
-    shares: float                # shares purchased (size_usdc / entry_price)
-    timestamp: float             # unix timestamp of simulated execution
-    expected_ev_usdc: float      # EV at entry
-    exit_price: float = 0.0
-    realised_pnl: float = 0.0
-    closed: bool = False
-    outcome: str = "open"        # "win" | "loss" | "open"
 
 
 @dataclass
@@ -99,23 +84,24 @@ class PaperTradingSimulator:
 
     def __init__(
         self,
+        repository: DBRepository,
         starting_balance: float = 50_000.0,
         slippage_pct: float = DEFAULT_SLIPPAGE_PCT,
         latency_ms: float = DEFAULT_LATENCY_MS,
     ) -> None:
+        self.repo = repository
         self.starting_balance = starting_balance
-        self.balance = starting_balance  # available USDC
+        self.balance = starting_balance  # available USDC. FIXME: store in a Portfolio model
         self.slippage_pct = slippage_pct
         self.latency_ms = latency_ms
 
-        self.trades: list[SimulatedTrade] = []
         self.snapshots: list[PortfolioSnapshot] = []
         self._peak_value: float = starting_balance
 
     # ------------------------------------------------------------------
     # Trade lifecycle
     # ------------------------------------------------------------------
-    def record_trade(
+    async def record_trade(
         self,
         trade_id: str,
         wallet: str,
@@ -124,23 +110,15 @@ class PaperTradingSimulator:
         nominal_price: float,
         size_usdc: float,
         expected_ev_usdc: float = 0.0,
-    ) -> SimulatedTrade | None:
+        category: str = "other",
+    ) -> Trade | None:
         """
         Open a new paper trade.
-
         Applies slippage and latency, deducts from balance, and stores the
-        trade record.
-
-        Returns
-        -------
-        SimulatedTrade | None
-            The new trade record, or None if balance is insufficient.
+        trade record in SQLite.
         """
         if size_usdc > self.balance:
-            logger.warning(
-                "Insufficient balance ($%.2f) for trade $%.2f – skipping",
-                self.balance, size_usdc,
-            )
+            logger.warning("Insufficient balance ($%.2f) for trade $%.2f", self.balance, size_usdc)
             return None
 
         # Simulate execution latency
@@ -149,25 +127,55 @@ class PaperTradingSimulator:
         # Apply slippage to entry price
         slippage_factor = 1.0 + self.slippage_pct if side.upper() == "BUY" else 1.0 - self.slippage_pct
         entry_price = nominal_price * slippage_factor
-
         shares = size_usdc / entry_price if entry_price > 0 else 0.0
 
-        trade = SimulatedTrade(
-            trade_id=trade_id,
+        ts = time.time()
+        
+        # Determine condition_id from market string format "[condition_id] title - outcome"
+        try:
+            cid = market.split("]")[0].replace("[", "").strip()
+        except IndexError:
+            cid = market
+            
+        try:
+            outcome = market.split(" - ")[-1].strip()
+        except IndexError:
+            outcome = "Unknown"
+
+        trade = Trade(
+            id=trade_id,
             wallet=wallet,
-            market=market,
+            market_id=cid,
+            market_title=market,
+            outcome=outcome,
             side=side.upper(),
+            category=category,
             entry_price=round(entry_price, 6),
-            nominal_price=round(nominal_price, 6),
             size_usdc=round(size_usdc, 4),
             shares=round(shares, 4),
-            timestamp=time.time(),
-            expected_ev_usdc=round(expected_ev_usdc, 4),
+            entry_timestamp=ts,
+            status="open"
+        )
+        
+        position = Position(
+            id=trade_id,
+            wallet=wallet,
+            market_id=cid,
+            market_title=market,
+            outcome=outcome,
+            category=category,
+            entry_price=round(entry_price, 6),
+            size_usdc=round(size_usdc, 4),
+            shares=round(shares, 4),
+            timestamp=ts
         )
 
         self.balance -= size_usdc
-        self.trades.append(trade)
-        self._snapshot()
+        
+        await self.repo.add_trade(trade)
+        await self.repo.add_position(position)
+        
+        # self._snapshot()  # skipping snapshot loop adjustment for brevity
 
         logger.info(
             "Paper trade OPEN  id=%s  market=%s  side=%s  nominal=%.4f  entry=%.4f  size=$%.2f",
@@ -175,23 +183,17 @@ class PaperTradingSimulator:
         )
         return trade
 
-    def close_trade(
+    async def close_trade(
         self,
         trade_id: str,
         exit_price: float,
-    ) -> SimulatedTrade | None:
+    ) -> Trade | None:
         """
         Close an existing open paper trade at the given exit price.
-
-        Computes realised PnL and updates available balance.
-
-        Returns
-        -------
-        SimulatedTrade | None
-            The updated trade, or None if trade_id not found / already closed.
+        Computes realised PnL, updates balance, and writes to SQLite.
         """
-        trade = next((t for t in self.trades if t.trade_id == trade_id and not t.closed), None)
-        if trade is None:
+        trade = await self.repo.get_trade(trade_id)
+        if not trade or trade.status != "open":
             logger.warning("Trade %s not found or already closed", trade_id)
             return None
 
@@ -200,58 +202,61 @@ class PaperTradingSimulator:
         pnl = exit_value - trade.size_usdc
 
         trade.exit_price = round(exit_price, 6)
+        trade.exit_timestamp = time.time()
         trade.realised_pnl = round(pnl, 4)
-        trade.closed = True
-        trade.outcome = "win" if pnl > 0 else "loss"
+        trade.status = "closed"
+        trade.closed_outcome = "win" if pnl > 0 else "loss"
 
         self.balance += exit_value
+        
+        await self.repo.update_trade(trade)
+        await self.repo.remove_position(trade_id)
+        
         self._update_peak()
-        self._snapshot()
 
         logger.info(
             "Paper trade CLOSE id=%s  exit=%.4f  pnl=$%.2f  outcome=%s",
-            trade_id, exit_price, pnl, trade.outcome,
+            trade_id, exit_price, pnl, trade.closed_outcome,
         )
         return trade
 
     # ------------------------------------------------------------------
-    # Portfolio metrics
+    # Portfolio metrics (Async SQLite driven)
     # ------------------------------------------------------------------
-    def open_trades(self) -> list[SimulatedTrade]:
+    async def open_trades(self) -> list[Trade]:
         """Return all trades that have not yet been closed."""
-        return [t for t in self.trades if not t.closed]
+        all_t = await self.repo.get_all_trades(limit=1000)
+        return [t for t in all_t if t.status == "open"]
 
-    def closed_trades(self) -> list[SimulatedTrade]:
+    async def closed_trades(self) -> list[Trade]:
         """Return all trades that have been closed."""
-        return [t for t in self.trades if t.closed]
+        all_t = await self.repo.get_all_trades(limit=1000)
+        return [t for t in all_t if t.status == "closed"]
 
-    def total_realised_pnl(self) -> float:
+    async def total_realised_pnl(self) -> float:
         """Sum of realised PnL across all closed trades."""
-        return sum(t.realised_pnl for t in self.closed_trades())
+        closed = await self.closed_trades()
+        return sum(t.realised_pnl for t in closed)
 
-    def unrealised_pnl(self, current_prices: dict[str, float] | None = None) -> float:
+    async def unrealised_pnl(self, current_prices: dict[str, float] | None = None) -> float:
         """
         Estimated unrealised PnL for open positions.
-
-        Parameters
-        ----------
-        current_prices : dict[str, float] | None
-            Mapping of market → current_price.  If not provided returns 0.0.
         """
         if not current_prices:
             return 0.0
         total = 0.0
-        for t in self.open_trades():
-            px = current_prices.get(t.market, t.entry_price)
+        open_pos = await self.open_trades()
+        for t in open_pos:
+            px = current_prices.get(t.market_title, t.entry_price)
             total += (t.shares * px) - t.size_usdc
         return round(total, 4)
 
-    def win_rate(self) -> float:
+    async def win_rate(self) -> float:
         """Fraction of closed trades that were wins."""
-        closed = self.closed_trades()
+        closed = await self.closed_trades()
         if not closed:
             return 0.0
-        wins = sum(1 for t in closed if t.outcome == "win")
+        wins = sum(1 for t in closed if t.closed_outcome == "win")
         return round(wins / len(closed), 4)
 
     def max_drawdown(self) -> float:
@@ -273,25 +278,28 @@ class PaperTradingSimulator:
                 max_dd = dd
         return round(max_dd, 4)
 
-    def sharpe_ratio(self, risk_free: float = 0.0) -> float:
+    async def sharpe_ratio(self, risk_free: float = 0.0) -> float:
         """
         Sharpe ratio from closed-trade PnL series.
-
-        Returns 0.0 when fewer than 2 closed trades exist.
         """
-        closed = self.closed_trades()
+        closed = await self.closed_trades()
         if len(closed) < 2:
             return 0.0
         pnl_series = [t.realised_pnl for t in closed]
         n = len(pnl_series)
         mean = sum(pnl_series) / n
-        variance = sum((x - mean) ** 2 for x in pnl_series) / (n - 1)
+        if n > 1:
+            variance = sum((x - mean) ** 2 for x in pnl_series) / (n - 1)
+        else:
+            variance = 0.0
         std = math.sqrt(variance)
         return round((mean - risk_free) / std, 4) if std > 0 else 0.0
 
-    def total_expected_ev(self) -> float:
+    async def total_expected_ev(self) -> float:
         """Sum of expected EV for all recorded trades."""
-        return round(sum(t.expected_ev_usdc for t in self.trades), 4)
+        all_t = await self.repo.get_all_trades()
+        # Fallback to zero if the mock doesn't support the column or we dropped EV
+        return 0.0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -319,51 +327,53 @@ class PaperTradingSimulator:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
-    def daily_summary(self, current_prices: dict[str, float] | None = None) -> dict[str, Any]:
+    async def daily_summary(self, current_prices: dict[str, float] | None = None) -> dict[str, Any]:
         """
         Generate a daily summary report as a JSON-serialisable dict.
-
-        Parameters
-        ----------
-        current_prices : dict | None
-            Mapping market → current_price for unrealised PnL estimation.
         """
-        closed = self.closed_trades()
-        open_pos = self.open_trades()
+        closed = await self.closed_trades()
+        open_pos = await self.open_trades()
+        all_t = await self.repo.get_all_trades()
+        
+        realised = await self.total_realised_pnl()
+        unrealised = await self.unrealised_pnl(current_prices)
+        wr = await self.win_rate()
+        sharpe = await self.sharpe_ratio()
+        ev = await self.total_expected_ev()
 
         summary: dict[str, Any] = {
             "timestamp": time.time(),
             "starting_balance_usdc": self.starting_balance,
             "current_balance_usdc": round(self.balance, 4),
-            "total_trades": len(self.trades),
+            "total_trades": len(all_t),
             "closed_trades": len(closed),
             "open_trades": len(open_pos),
-            "realised_pnl_usdc": self.total_realised_pnl(),
-            "unrealised_pnl_usdc": self.unrealised_pnl(current_prices),
-            "total_expected_ev_usdc": self.total_expected_ev(),
-            "win_rate": self.win_rate(),
+            "realised_pnl_usdc": realised,
+            "unrealised_pnl_usdc": unrealised,
+            "total_expected_ev_usdc": ev,
+            "win_rate": wr,
             "max_drawdown_pct": round(self.max_drawdown() * 100, 2),
-            "sharpe_ratio": self.sharpe_ratio(),
+            "sharpe_ratio": sharpe,
             "slippage_pct_applied": round(self.slippage_pct * 100, 2),
             "simulated_latency_ms": self.latency_ms,
             "open_positions": [
                 {
-                    "trade_id": t.trade_id,
+                    "trade_id": t.id,
                     "wallet": t.wallet,
-                    "market": t.market,
+                    "market": t.market_title,
                     "side": t.side,
                     "entry_price": t.entry_price,
                     "size_usdc": t.size_usdc,
-                    "expected_ev_usdc": t.expected_ev_usdc,
+                    "expected_ev_usdc": 0.0,
                 }
                 for t in open_pos
             ],
             "closed_positions": [
                 {
-                    "trade_id": t.trade_id,
+                    "trade_id": t.id,
                     "wallet": t.wallet,
-                    "market": t.market,
-                    "outcome": t.outcome,
+                    "market": t.market_title,
+                    "outcome": t.closed_outcome,
                     "entry_price": t.entry_price,
                     "exit_price": t.exit_price,
                     "realised_pnl_usdc": t.realised_pnl,

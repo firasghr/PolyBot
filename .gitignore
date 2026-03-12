@@ -44,3 +44,7 @@ frontend/coverage/
 # OS
 .DS_Store
 Thumbs.db
+
+# Databases
+*.db
+*.sqlite
