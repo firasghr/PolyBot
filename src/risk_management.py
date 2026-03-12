@@ -83,8 +83,33 @@ def adjusted_kelly(
 
 
 # ---------------------------------------------------------------------------
-# Slippage helpers (v3 - exact orderbook matching)
+# Slippage helpers
 # ---------------------------------------------------------------------------
+def estimate_slippage(size_usdc: float) -> float:
+    """
+    Estimate slippage based on trade size.
+
+    Returns:
+      - MIN_SLIPPAGE (1%) for small trades (< $500)
+      - MAX_SLIPPAGE (3%) for large trades (>= $5,000)
+      - DEFAULT_SLIPPAGE (2%) for medium trades
+    """
+    if size_usdc < 500:
+        return MIN_SLIPPAGE
+    if size_usdc >= 5_000:
+        return MAX_SLIPPAGE
+    return DEFAULT_SLIPPAGE
+
+
+def apply_slippage(size_usdc: float, slippage: float) -> float:
+    """
+    Return the effective trade size after deducting slippage cost.
+
+    effective = size * (1 - slippage)
+    """
+    return size_usdc * (1.0 - slippage)
+
+
 def calculate_exact_slippage(
     desired_size_usdc: float, 
     orderbook: dict[str, Any], 
@@ -165,8 +190,16 @@ def size_single_trade(
     kelly_mode: str = DEFAULT_KELLY,
     orderbook: dict[str, Any] | None = None,
     side: str = "BUY",
+    override_slippage: float | None = None,
 ) -> dict[str, Any]:
-    """Compute the recommended USDC trade size via Kelly and exact orderbook slippage."""
+    """Compute the recommended USDC trade size via Kelly and slippage adjustment.
+
+    Parameters
+    ----------
+    override_slippage : float | None
+        When provided, use this exact slippage fraction instead of estimating
+        from the orderbook.  Pass ``0.0`` to disable slippage entirely.
+    """
     # 1. Compute Kelly-scaled allocation fraction
     frac = adjusted_kelly(win_rate, avg_win_pct, avg_loss_pct, kelly_mode)
     kelly_size = portfolio_value_usdc * frac
@@ -175,22 +208,30 @@ def size_single_trade(
     max_risk_size = portfolio_value_usdc * MAX_PORTFOLIO_RISK
     risk_capped = min(kelly_size, max_risk_size)
 
-    # 3. Exact Orderbook Slippage calculation
+    # 3. Slippage calculation
     slippage = 0.0
     effective = risk_capped
     abort_reason = ""
-    
-    if orderbook:
+
+    if override_slippage is not None:
+        # Caller supplied an explicit slippage fraction (including 0.0 = no slippage)
+        slippage = float(override_slippage)
+        effective = apply_slippage(risk_capped, slippage)
+    elif orderbook:
         effective, slippage, abort_reason = calculate_exact_slippage(
             desired_size_usdc=risk_capped,
             orderbook=orderbook,
-            side=side
+            side=side,
         )
+    else:
+        # Estimate slippage from trade size when no orderbook is available
+        slippage = estimate_slippage(risk_capped)
+        effective = apply_slippage(risk_capped, slippage)
 
     # 4. Enforce minimum trade size
     clamped = effective < MIN_TRADE_SIZE_USDC
     final_size = max(effective, MIN_TRADE_SIZE_USDC) if effective > 0 else 0.0
-    
+
     if abort_reason:
         final_size = 0.0
 
