@@ -69,6 +69,7 @@ _state: dict[str, Any] = {
     "sizing_map": {},  # wallet -> recommended USDC size
     "trade_log": [],
     "last_discovery": 0.0,
+    "simulator": PaperTradingSimulator(starting_balance=PORTFOLIO_VALUE_USDC),
 }
 
 # Active WebSocket connections
@@ -105,15 +106,10 @@ async def _on_trade_detected(signal: dict[str, Any]) -> None:
     # Handle EXIT Signals (SELL orders)
     if signal_type == "EXIT":
         logger.info("EXIT signal received for %s on %s", wallet, market_str)
-        
-        async with async_session_maker() as session:
-            repo = DBRepository(session)
-            sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-            # Find if we have an open position matching this market to close
-            open_trades = [t for t in await sim.open_trades() if t.market_title == market_str]
-            for t in open_trades:
-                await sim.close_trade(t.id, exit_price=price)
-                logger.info("Closed paper trade %s due to wallet EXIT signal at %.4f", t.id, price)
+        open_trades = [t for t in sim.open_trades() if t.market_title == market_str]
+        for t in open_trades:
+            sim.close_trade(t.trade_id, exit_price=price)
+            logger.info("Closed paper trade %s due to wallet EXIT signal at %.4f", t.trade_id, price)
         return
 
     # Handle ENTRY Signals (BUY orders)
@@ -126,69 +122,67 @@ async def _on_trade_detected(signal: dict[str, Any]) -> None:
     # 3. Check Portfolio Risk Manager (Category & Count Limits)
     category = _classify_market(signal.get("title", ""))
     
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        
-        can_trade, reason = risk_manager.can_open_trade(
-            new_trade_size=adjusted_size,
+    can_trade, reason = risk_manager.can_open_trade(
+        new_trade_size=adjusted_size,
+        category=category,
+        total_portfolio_value=sim.balance,
+        open_trades=sim.open_trades(),
+    )
+    if not can_trade:
+        logger.info("Trade rejected by Risk Manager: %s", reason)
+        return
+
+    # 4. Fetch Orderbook & Calculate Exact Slippage
+    orderbook = await market_cache.get_orderbook(condition_id)
+    
+    logger.debug("Applying exact orderbook slippage check for %s", condition_id)
+    from src.risk_management import calculate_exact_slippage
+    effective_size, slippage_pct, abort_reason = calculate_exact_slippage(
+        desired_size_usdc=adjusted_size, 
+        orderbook=orderbook, 
+        side=signal["side"]
+    )
+    
+    if abort_reason:
+        logger.warning("Trade aborted due to slippage rules: %s", abort_reason)
+        return
+
+    # 5. Feed to paper trading simulator (or EVM in Live Mode)
+    if MODE == "paper":
+        trade = sim.record_trade(
+            trade_id=signal["signal_id"],
+            wallet=wallet,
+            market=market_str,
+            side=signal["side"],
+            nominal_price=price,
+            size_usdc=effective_size,
             category=category,
-            total_portfolio_value=sim.balance,
-            open_trades=await sim.open_trades(),
-        )
-        if not can_trade:
-            logger.info("Trade rejected by Risk Manager: %s", reason)
-            return
-
-        # 4. Fetch Orderbook & Calculate Exact Slippage
-        orderbook = await market_cache.get_orderbook(condition_id)
-        
-        logger.debug("Applying exact orderbook slippage check for %s", condition_id)
-        from src.risk_management import calculate_exact_slippage
-        effective_size, slippage_pct, abort_reason = calculate_exact_slippage(
-            desired_size_usdc=adjusted_size, 
-            orderbook=orderbook, 
-            side=signal["side"]
         )
         
-        if abort_reason:
-            logger.warning("Trade aborted due to slippage rules: %s", abort_reason)
-            return
-
-        # 5. Feed to paper trading simulator (or EVM in Live Mode)
-        if MODE == "paper":
-            trade = await sim.record_trade(
-                trade_id=signal["signal_id"],
-                wallet=wallet,
-                market=market_str,
-                side=signal["side"],
-                nominal_price=price,
-                size_usdc=effective_size,
-                category=category,
-            )
+        if trade:
+            log_entry = {
+                "trade_id": trade.trade_id,
+                "wallet": wallet,
+                "market": market_str,
+                "status": "opened",
+                "timestamp": trade.entry_timestamp,
+            }
+            _state["trade_log"].append(log_entry)
+            await _broadcast({"type": "trade_opened", "trade": log_entry})
             
-            if trade:
-                log_entry = {
-                    "trade_id": trade.id,
-                    "wallet": wallet,
-                    "market": market_str,
-                    "status": "opened",
-                    "timestamp": trade.entry_timestamp,
-                }
-                _state["trade_log"].append(log_entry)
-                await _broadcast({"type": "trade_opened", "trade": log_entry})
-                
-                msg = (
-                    f"✅ Paper trade opened\n"
-                    f"Wallet: {wallet[:6]}…{wallet[-4:]}\n"
-                    f"Market: {market_str}\n"
-                    f"Size: ${effective_size:.2f}  Price: {price:.4f}  Slippage: {slippage_pct*100:.2f}%"
-                )
-                if confluence.multiplier > 1.0:
-                    msg += f"\n🔥 Confluence Multiplier: {confluence.multiplier}x"
-                
-                await send_telegram_alert(msg)
-        elif MODE == "live":
+            msg = (
+                f"✅ Paper trade opened\n"
+                f"Wallet: {wallet[:6]}…{wallet[-4:]}\n"
+                f"Market: {market_str}\n"
+                f"Size: ${effective_size:.2f}  Price: {price:.4f}  Slippage: {slippage_pct*100:.2f}%"
+            )
+            if confluence.multiplier > 1.0:
+                msg += f"\n🔥 Confluence Multiplier: {confluence.multiplier}x"
+            
+            await send_telegram_alert(msg)
+    elif MODE == "live":
+        async with async_session_maker() as session:
+            repo = DBRepository(session)
             from src.evm_execution import EVMExecutionService
             live_executable = EVMExecutionService(repo)
             trade = await live_executable.execute_trade(
@@ -200,31 +194,31 @@ async def _on_trade_detected(signal: dict[str, Any]) -> None:
                 nominal_price=price,
                 category=category,
             )
+        
+        if trade:
+            log_entry = {
+                "trade_id": trade.id,
+                "wallet": wallet,
+                "market": market_str,
+                "status": "opened_live",
+                "timestamp": trade.entry_timestamp,
+            }
+            _state["trade_log"].append(log_entry)
+            await _broadcast({"type": "trade_opened", "trade": log_entry})
             
-            if trade:
-                log_entry = {
-                    "trade_id": trade.id,
-                    "wallet": wallet,
-                    "market": market_str,
-                    "status": "opened_live",
-                    "timestamp": trade.entry_timestamp,
-                }
-                _state["trade_log"].append(log_entry)
-                await _broadcast({"type": "trade_opened", "trade": log_entry})
-                
-                msg = (
-                    f"🚨 LIVE TRADE EXECUTED\n"
-                    f"Wallet: {wallet[:6]}…{wallet[-4:]}\n"
-                    f"Market: {market_str}\n"
-                    f"Size: ${effective_size:.2f}  Price: {price:.4f}  Slippage: {slippage_pct*100:.2f}%\n"
-                    f"TX Hash: {trade.evm_tx_hash}"
-                )
-                if confluence.multiplier > 1.0:
-                    msg += f"\n🔥 Confluence Multiplier: {confluence.multiplier}x"
-                
-                await send_telegram_alert(msg)
-        else:
-            logger.warning("Unknown MODE: %s", MODE)
+            msg = (
+                f"🚨 LIVE TRADE EXECUTED\n"
+                f"Wallet: {wallet[:6]}…{wallet[-4:]}\n"
+                f"Market: {market_str}\n"
+                f"Size: ${effective_size:.2f}  Price: {price:.4f}  Slippage: {slippage_pct*100:.2f}%\n"
+                f"TX Hash: {trade.evm_tx_hash}"
+            )
+            if confluence.multiplier > 1.0:
+                msg += f"\n🔥 Confluence Multiplier: {confluence.multiplier}x"
+            
+            await send_telegram_alert(msg)
+    else:
+        logger.warning("Unknown MODE: %s", MODE)
 
 
 
@@ -267,41 +261,39 @@ async def _background_market_resolution_loop(interval_seconds: int = 60) -> None
     """Poll market cache to see if any open paper trades have resolved."""
     while True:
         try:
-            async with async_session_maker() as session:
-                repo = DBRepository(session)
-                sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-                open_trades = await sim.open_trades()
-                
-                for trade in open_trades:
-                    # Our market string format: "[cond_id] Title - Outcome"
-                    if trade.market_title.startswith("[") and "]" in trade.market_title:
-                        cond_id = trade.market_title[1:trade.market_title.find("]")]
-                        resolved, winner = market_cache.get_resolution(cond_id)
+            sim: PaperTradingSimulator = _state["simulator"]
+            open_trades = sim.open_trades()
+            
+            for trade in open_trades:
+                # Our market string format: "[cond_id] Title - Outcome"
+                if trade.market.startswith("[") and "]" in trade.market:
+                    cond_id = trade.market[1:trade.market.find("]")]
+                    resolved, winner = market_cache.get_resolution(cond_id)
+                    
+                    if resolved:
+                        # Parse the outcome the user bet on from the " - Outcome" suffix
+                        target_outcome = trade.market.split(" - ")[-1]
                         
-                        if resolved:
-                            # Parse the outcome the user bet on from the " - Outcome" suffix
-                            target_outcome = trade.market_title.split(" - ")[-1]
-                            
-                            # Compare user outcome with winner
-                            user_won = (winner.lower() == target_outcome.lower()) if winner else False
-                            
-                            # In polymarket, winning shares pay $1. Losing ones pay $0.
-                            exit_price = 1.0 if user_won else 0.0
-                            
-                            result = await sim.close_trade(trade.id, exit_price)
-                            if result:
-                                log_entry = {
-                                    "trade_id": result.id,
-                                    "outcome": result.closed_outcome,
-                                    "realised_pnl_usdc": result.realised_pnl,
-                                    "exit_price": result.exit_price,
-                                }
-                                await _broadcast({"type": "trade_closed", "trade": log_entry})
-                                await send_telegram_alert(
-                                    f"{'🟢' if result.closed_outcome == 'win' else '🔴'} Market Resolved\n"
-                                    f"Outcome: {result.closed_outcome.upper()}  PnL: ${result.realised_pnl:.2f}\n"
-                                    f"Market: {trade.market_title}"
-                                )
+                        # Compare user outcome with winner
+                        user_won = (winner.lower() == target_outcome.lower()) if winner else False
+                        
+                        # In polymarket, winning shares pay $1. Losing ones pay $0.
+                        exit_price = 1.0 if user_won else 0.0
+                        
+                        result = sim.close_trade(trade.trade_id, exit_price)
+                        if result:
+                            log_entry = {
+                                "trade_id": result.trade_id,
+                                "outcome": result.outcome,
+                                "realised_pnl_usdc": result.realised_pnl,
+                                "exit_price": result.exit_price,
+                            }
+                            await _broadcast({"type": "trade_closed", "trade": log_entry})
+                            await send_telegram_alert(
+                                f"{'🟢' if result.outcome == 'win' else '🔴'} Market Resolved\n"
+                                f"Outcome: {result.outcome.upper()}  PnL: ${result.realised_pnl:.2f}\n"
+                                f"Market: {trade.market}"
+                            )
                                 
         except asyncio.CancelledError:
             raise
@@ -401,95 +393,82 @@ async def get_top_traders() -> dict:
 @app.get("/api/positions")
 async def get_positions() -> dict:
     """Return current active (paper) positions."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        open_pos = await sim.open_trades()
-        
-        return {
-            "open_positions": [
-                {
-                    "trade_id": t.id,
-                    "wallet": t.wallet,
-                    "market": t.market_title,
-                    "side": t.side,
-                    "entry_price": t.entry_price,
-                    "size_usdc": t.size_usdc,
-                    "expected_ev_usdc": 0.0,
-                    "timestamp": t.entry_timestamp,
-                }
-                for t in open_pos
-            ],
-            "count": len(open_pos),
-        }
+    sim: PaperTradingSimulator = _state["simulator"]
+    open_pos = sim.open_trades()
+    
+    return {
+        "open_positions": [
+            {
+                "trade_id": t.trade_id,
+                "wallet": t.wallet,
+                "market": t.market,
+                "side": t.side,
+                "entry_price": t.entry_price,
+                "size_usdc": t.size_usdc,
+                "expected_ev_usdc": 0.0,
+                "timestamp": t.entry_timestamp,
+            }
+            for t in open_pos
+        ],
+        "count": len(open_pos),
+    }
 
 
 @app.get("/api/pnl")
 async def get_pnl() -> dict:
     """Return realised and unrealised PnL summary."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        
-        realised = await sim.total_realised_pnl()
-        unrealised = await sim.unrealised_pnl()
-        wr = await sim.win_rate()
-        sharpe = await sim.sharpe_ratio()
-        all_t = await repo.get_all_trades()
-        
-        return {
-            "realised_pnl_usdc": realised,
-            "unrealised_pnl_usdc": unrealised,
-            "win_rate": wr,
-            "max_drawdown_pct": round(sim.max_drawdown() * 100, 2),
-            "sharpe_ratio": sharpe,
-            "total_trades": len(all_t),
-        }
+    sim: PaperTradingSimulator = _state["simulator"]
+    
+    return {
+        "realised_pnl_usdc": sim.total_realised_pnl(),
+        "unrealised_pnl_usdc": sim.unrealised_pnl(),
+        "win_rate": sim.win_rate(),
+        "max_drawdown_pct": round(sim.max_drawdown() * 100, 2),
+        "sharpe_ratio": sim.sharpe_ratio(),
+        "total_trades": len(sim.trades),
+    }
 
 
 @app.get("/api/portfolio")
 async def get_portfolio() -> dict:
     """Return portfolio value and asset allocation."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        
-        realised = await sim.total_realised_pnl()
-        unrealised = await sim.unrealised_pnl()
-        total_value = PORTFOLIO_VALUE_USDC + realised + unrealised
-        
-        return {
-            "total_value_usdc": total_value,
-            "cash_usdc": PORTFOLIO_VALUE_USDC + realised,
-            "invested_usdc": sum(t.size_usdc for t in await sim.open_trades()),
-            "currency": "USDC",
-        }
+    sim: PaperTradingSimulator = _state["simulator"]
+    
+    realised = sim.total_realised_pnl()
+    unrealised = sim.unrealised_pnl()
+    total_value = PORTFOLIO_VALUE_USDC + realised + unrealised
+    
+    return {
+        "total_value_usdc": total_value,
+        "cash_usdc": PORTFOLIO_VALUE_USDC + realised,
+        "invested_usdc": sum(t.size_usdc for t in sim.open_trades()),
+        "currency": "USDC",
+    }
 
 
 @app.get("/api/trades")
 async def get_trades(limit: int = 100) -> dict:
     """Return historical executed trades limit N."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        trades = await repo.get_all_trades(limit=limit)
-        return {
-            "trades": [
-                {
-                    "trade_id": t.id,
-                    "wallet": t.wallet,
-                    "market": t.market_title,
-                    "side": t.side,
-                    "entry_price": t.entry_price,
-                    "exit_price": t.exit_price,
-                    "size_usdc": t.size_usdc,
-                    "realised_pnl": t.realised_pnl,
-                    "status": t.status,
-                    "category": t.category,
-                    "timestamp": t.entry_timestamp,
-                }
-                for t in trades
-            ]
-        }
+    sim: PaperTradingSimulator = _state["simulator"]
+    trades = sim.trades[-limit:]
+    return {
+        "trades": [
+            {
+                "trade_id": t.trade_id,
+                "wallet": t.wallet,
+                "market": t.market,
+                "side": t.side,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "size_usdc": t.size_usdc,
+                "realised_pnl": t.realised_pnl,
+                "status": t.status,
+                "category": t.category,
+                "timestamp": t.entry_timestamp,
+            }
+            for t in trades
+        ]
+    }
 
 
 @app.get("/api/sizing")
@@ -505,19 +484,15 @@ async def get_position_sizes() -> dict:
 @app.get("/api/report")
 async def get_daily_report() -> dict:
     """Return the full daily summary report from the paper trading simulator."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        return await sim.daily_summary()
+    sim: PaperTradingSimulator = _state["simulator"]
+    return sim.daily_summary()
 
 
 @app.get("/api/performance-report")
 async def get_performance_report() -> dict:
     """Alias for /api/report for backward compatibility/standardization."""
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        return await sim.daily_summary()
+    sim: PaperTradingSimulator = _state["simulator"]
+    return sim.daily_summary()
 
 
 @app.post("/api/trades/open")
@@ -525,38 +500,36 @@ async def open_paper_trade(trade: dict) -> dict:
     """
     Open a new paper trade manually (mostly for testing).
     """
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        
-        result = await sim.record_trade(
-            trade_id=trade.get("trade_id", str(time.time())),
-            wallet=trade.get("wallet", ""),
-            market=trade.get("market", ""),
-            side=trade.get("side", "BUY"),
-            nominal_price=float(trade.get("entry_price", 0)),
-            size_usdc=float(trade.get("size_usdc", 0)),
-            expected_ev_usdc=float(trade.get("expected_ev_usdc", 0)),
-            category=_classify_market(trade.get("market", "")),
-        )
-        if result is None:
-            raise HTTPException(status_code=400, detail="Insufficient balance or invalid trade")
+    sim: PaperTradingSimulator = _state["simulator"]
+    
+    result = sim.record_trade(
+        trade_id=trade.get("trade_id", str(time.time())),
+        wallet=trade.get("wallet", ""),
+        market=trade.get("market", ""),
+        side=trade.get("side", "BUY"),
+        nominal_price=float(trade.get("entry_price", 0)),
+        size_usdc=float(trade.get("size_usdc", 0)),
+        expected_ev_usdc=float(trade.get("expected_ev_usdc", 0)),
+        category=_classify_market(trade.get("market", "")),
+    )
+    if result is None:
+        raise HTTPException(status_code=400, detail="Insufficient balance or invalid trade")
 
-        log_entry = {
-            "trade_id": result.id,
-            "wallet": result.wallet,
-            "market": result.market_title,
-            "status": "opened",
-            "timestamp": result.entry_timestamp,
-        }
-        _state["trade_log"].append(log_entry)
-        await _broadcast({"type": "trade_opened", "trade": log_entry})
-        await send_telegram_alert(
-            f"✅ Manual paper trade opened\n"
-            f"Market: {result.market_title}\n"
-            f"Side: {result.side}  Size: ${result.size_usdc:.2f}  Price: {result.entry_price:.4f}"
-        )
-        return log_entry
+    log_entry = {
+        "trade_id": result.trade_id,
+        "wallet": result.wallet,
+        "market": result.market,
+        "status": "opened",
+        "timestamp": result.entry_timestamp,
+    }
+    _state["trade_log"].append(log_entry)
+    await _broadcast({"type": "trade_opened", "trade": log_entry})
+    await send_telegram_alert(
+        f"✅ Manual paper trade opened\n"
+        f"Market: {result.market}\n"
+        f"Side: {result.side}  Size: ${result.size_usdc:.2f}  Price: {result.entry_price:.4f}"
+    )
+    return log_entry
 
 
 @app.post("/api/trades/close")
@@ -564,28 +537,26 @@ async def close_paper_trade(payload: dict) -> dict:
     """
     Close an existing paper trade manually.
     """
-    async with async_session_maker() as session:
-        repo = DBRepository(session)
-        sim = PaperTradingSimulator(repo, starting_balance=PORTFOLIO_VALUE_USDC)
-        
-        trade_id = payload.get("trade_id", "")
-        exit_price = float(payload.get("exit_price", 0))
-        result = await sim.close_trade(trade_id, exit_price)
-        if result is None:
-            raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
+    sim: PaperTradingSimulator = _state["simulator"]
+    
+    trade_id = payload.get("trade_id", "")
+    exit_price = float(payload.get("exit_price", 0))
+    result = sim.close_trade(trade_id, exit_price)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
 
-        log_entry = {
-            "trade_id": result.id,
-            "outcome": result.closed_outcome,
-            "realised_pnl_usdc": result.realised_pnl,
-            "exit_price": result.exit_price,
-        }
-        await _broadcast({"type": "trade_closed", "trade": log_entry})
-        await send_telegram_alert(
-            f"{'🟢' if result.closed_outcome == 'win' else '🔴'} Manual trade closed\n"
-            f"Outcome: {result.closed_outcome.upper()}  PnL: ${result.realised_pnl:.2f}"
-        )
-        return log_entry
+    log_entry = {
+        "trade_id": result.trade_id,
+        "outcome": result.outcome,
+        "realised_pnl_usdc": result.realised_pnl,
+        "exit_price": result.exit_price,
+    }
+    await _broadcast({"type": "trade_closed", "trade": log_entry})
+    await send_telegram_alert(
+        f"{'🟢' if result.outcome == 'win' else '🔴'} Manual trade closed\n"
+        f"Outcome: {result.outcome.upper()}  PnL: ${result.realised_pnl:.2f}"
+    )
+    return log_entry
 
 
 @app.get("/api/alerts")
